@@ -1,0 +1,172 @@
+name: CI/CD Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'WaylaAI.slnx'
+      - 'WaylaAI.sln'
+      - 'Dockerfile'
+      - 'global.json'
+      - '.github/workflows/ci-cd-build-and-deploy.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'WaylaAI.slnx'
+      - 'Dockerfile'
+      - 'global.json'
+      - '.github/workflows/ci-cd-build-and-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+  id-token: write
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  SOLUTION_FILE: WaylaAI.slnx
+  INFRASTRUCTURE_PROJECT: src/WaylaAI.Infrastructure/WaylaAI.Infrastructure.csproj
+  API_PROJECT: src/WaylaAI.WebApi/WaylaAI.WebApi.csproj
+  AWS_REGION: eu-west-1
+
+jobs:
+  build-test-deploy:
+    name: CI/CD Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          cache: ${{ hashFiles('**/*.csproj') != '' }}
+          cache-dependency-path: |
+            **/*.csproj
+            **/*.slnx
+            global.json
+
+      - name: Cache NuGet packages
+        if: hashFiles('**/*.csproj') != ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Packages.props', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Restore dependencies
+        run: dotnet restore "${{ env.SOLUTION_FILE }}"
+
+      # Step 1 — Build .NET Application
+      - name: Build .NET Application
+        run: dotnet build "${{ env.SOLUTION_FILE }}" --configuration Release --no-restore
+
+      - name: Install EF Core tools
+        run: dotnet tool install --global dotnet-ef --version 10.*
+
+      - name: Add dotnet tools to PATH
+        run: echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      # Step 2 — Create Migrations (verify model + bundle for deploy)
+      - name: Create Migrations
+        id: create_migrations
+        run: |
+          if [ ! -f "${{ env.INFRASTRUCTURE_PROJECT }}" ]; then
+            echo "Infrastructure project not found — skipping migration steps until EF Core is added (B-012)."
+            echo "skip_migrations=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          dotnet ef migrations has-pending-model-changes \
+            --project "${{ env.INFRASTRUCTURE_PROJECT }}" \
+            --startup-project "${{ env.API_PROJECT }}" \
+            --configuration Release
+
+          dotnet ef migrations bundle \
+            --project "${{ env.INFRASTRUCTURE_PROJECT }}" \
+            --startup-project "${{ env.API_PROJECT }}" \
+            --configuration Release \
+            --output "${{ runner.temp }}/efbundle" \
+            --force
+
+          echo "skip_migrations=false" >> "$GITHUB_OUTPUT"
+
+      - name: Upload migration bundle
+        if: steps.create_migrations.outputs.skip_migrations != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ef-migration-bundle
+          path: ${{ runner.temp }}/efbundle
+          retention-days: 7
+
+      # Step 3 — Run Unit Tests
+      - name: Run Unit Tests
+        run: |
+          if find tests -name '*.csproj' -print -quit 2>/dev/null | grep -q .; then
+            dotnet test "${{ env.SOLUTION_FILE }}" --configuration Release --no-build --verbosity normal
+          else
+            echo "No test projects found — skipping until test projects are added (B-010)."
+          fi
+
+      # Step 4 — Run Database Migrations (deploy path only)
+      - name: Run Database Migrations
+        if: github.event_name != 'pull_request' && steps.create_migrations.outputs.skip_migrations != 'true'
+        env:
+          CONNECTION_STRING: ${{ secrets.DATABASE_CONNECTION_STRING }}
+        run: |
+          if [ -z "$CONNECTION_STRING" ]; then
+            echo "DATABASE_CONNECTION_STRING secret is not configured — skipping migration apply."
+            exit 0
+          fi
+
+          chmod +x "${{ runner.temp }}/efbundle"
+          "${{ runner.temp }}/efbundle" --connection "$CONNECTION_STRING" --verbose
+
+      # Step 5 — Deploy to Environment (deploy path only)
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request' && vars.AWS_DEPLOY_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to Environment
+        if: github.event_name != 'pull_request' && vars.AWS_DEPLOY_ROLE_ARN != ''
+        env:
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_SERVICE: ${{ vars.ECS_SERVICE }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          if [ -z "$ECR_REPOSITORY" ] || [ -z "$ECS_CLUSTER" ] || [ -z "$ECS_SERVICE" ]; then
+            echo "Deploy variables not configured — build and test completed; configure AWS_DEPLOY_ROLE_ARN, ECR_REPOSITORY, ECS_CLUSTER, and ECS_SERVICE to enable deploy."
+            exit 0
+          fi
+
+          if [ ! -f Dockerfile ]; then
+            echo "Dockerfile not found — skipping container deploy."
+            exit 0
+          fi
+
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment \
+            --region "$AWS_REGION"
