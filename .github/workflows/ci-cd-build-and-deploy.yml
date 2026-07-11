@@ -17,7 +17,6 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'WaylaAI.slnx'
-      - 'WaylaAI.sln'
       - 'Dockerfile'
       - 'global.json'
       - '.github/workflows/ci-cd-build-and-deploy.yml'
@@ -50,13 +49,14 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-          cache: true
+          cache: ${{ hashFiles('**/*.csproj') != '' }}
           cache-dependency-path: |
             **/*.csproj
             **/*.slnx
             global.json
 
       - name: Cache NuGet packages
+        if: hashFiles('**/*.csproj') != ''
         uses: actions/cache@v4
         with:
           path: ~/.nuget/packages
