@@ -2,7 +2,7 @@ name: CI/CD Build and Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - 'src/**'
       - 'tests/**'
@@ -12,7 +12,7 @@ on:
       - 'global.json'
       - '.github/workflows/ci-cd-build-and-deploy.yml'
   pull_request:
-    branches: [main]
+    branches: [main, develop]
     paths:
       - 'src/**'
       - 'tests/**'
